@@ -132,7 +132,6 @@ class Zoo(torch.nn.Module):
 
         self.pipe = pipe
         self.seed = seed
-        # NOTE: dtype is the mixed dtype; transformer is still in float32
         self.device, self.dtype = device, dtype
         self.config = config
         self.noise_scheduler_copy = deepcopy(pipe.scheduler)
@@ -328,6 +327,7 @@ def get_model_and_tokenizer(path, device, dtype, seed, do_compile, config):
     transformer = Flux2Transformer2DModel.from_pretrained("black-forest-labs/FLUX.2-klein-4B" if path is None
                                                            else path, # we save without a subdir
                                                            subfolder=None if path else 'transformer',
+                                                           torch_dtype=dtype,
                                                            quantization_config=BitsAndBytesConfig(load_in_8bit=True,) if config.quantize_model else None,
                                                            strict=False)
     target_modules = [
@@ -353,10 +353,9 @@ def get_model_and_tokenizer(path, device, dtype, seed, do_compile, config):
     from modeling.klein_batched_rope import batchify_transformer_rope
     transformer = batchify_transformer_rope(transformer)
 
-    pipe = Flux2KleinPipeline.from_pretrained("black-forest-labs/FLUX.2-klein-4B", 
+    pipe = Flux2KleinPipeline.from_pretrained("black-forest-labs/FLUX.2-klein-4B",
                                               transformer=transformer,
-                                              # full precision weights
-                                              torch_dtype=torch.float32,
+                                              torch_dtype=dtype,
                                               # we'll put things onto cuda ourselves
                                               device='cpu'
                                               ).to('cpu')
@@ -377,8 +376,9 @@ def get_model_and_tokenizer(path, device, dtype, seed, do_compile, config):
         logging.info('Caching prompt.')
         pipe.text_encoder = pipe.text_encoder.to(config.device)
         pipe.cached_prompt, pipe.cached_txt_ids = get_prompt_embeds_txt_ids(pipe,
-                                                                            config.teacher_use_prompt,
-                                                                            config.device,)
+                                                                            config.use_prompt,
+                                                                            config.device,
+                                                                            dtype=dtype,)
 
     if isinstance(config.teacher_use_prompt, str):
         logging.info('Caching prompt for our teacher.')
@@ -386,11 +386,17 @@ def get_model_and_tokenizer(path, device, dtype, seed, do_compile, config):
             pipe.text_encoder = pipe.text_encoder.to(config.device)
         pipe.cached_teacher_prompt, pipe.cached_teacher_txt_ids = get_prompt_embeds_txt_ids(pipe,
                                                                                             config.teacher_use_prompt,
-                                                                                            config.device,)
+                                                                                            config.device,
+                                                                                            dtype=dtype,)
     del pipe.text_encoder
     torch.cuda.empty_cache()
 
     pipe.transformer = add_single_stream_embedding_adapter(pipe.transformer)
+    
+    pipe.transformer.adapter = pipe.transformer.adapter.to(dtype)
+    pipe.transformer.in_linear = pipe.transformer.in_linear.to(dtype)
+    pipe.transformer.out_linear = pipe.transformer.out_linear.to(dtype)
+    pipe.transformer.score_embedder = pipe.transformer.score_embedder.to(dtype)
     if do_compile:
         pipe.transformer = torch.compile(pipe.transformer)
 
@@ -402,7 +408,8 @@ def get_model_and_tokenizer(path, device, dtype, seed, do_compile, config):
     # we load the LoRA early but apply the adapter in __init__
     if config.load_path:
         adapter_states = torch.load(f'{config.load_path}/adapter.pt', map_location='cpu')
-        transformer.load_state_dict(adapter_states, strict=False)
+        missing, unexpected = model.pipe.transformer.load_state_dict(adapter_states, strict=False)
+        assert not unexpected, f'Unexpected keys in adapter checkpoint: {unexpected}'
     model.pipe.transformer = model.pipe.transformer.to(device)
     return model
 
