@@ -256,14 +256,17 @@ class Zoo(torch.nn.Module):
             semantic_embeds = torch.nn.functional.pad(
                 semantic_embeds, (0, 0, 0, self.config.k - semantic_embeds.shape[1] + 1))
 
+        images_out = []
         for ind in [self.seed, self.seed+1]:
             width, height = self.config.resolution
             latent_seed_generator = torch.Generator(device="cuda").manual_seed(ind)
-            image = self.inference(semantic_embeds, guidance_scale, (width, height), 
+            image = self.inference(semantic_embeds, guidance_scale, (width, height),
                                    latent_seed_generator)
             logging.info(f'Saving at {self.config.log_dir}/latest_val_{ind}_{self.total_steps}.png')
             if save_images:
                 image.save(f'{self.config.log_dir}/latest_val_{ind}_{self.total_steps}.png')
+            images_out.append(image)
+        return images_out
 
     def process_inputs(self, batch):
         # target score goes first
@@ -297,9 +300,13 @@ class Zoo(torch.nn.Module):
                                                    config=self.config,)
                 losses.append(loss.item())
                 if index >= max_val_steps:
-                    return sum(losses) / len(losses)
-            self.do_qual_val(batch['sample_pixels'])
-            return sum(losses) / len(losses)
+                    # NOTE: previously this qual-image call sat unreachably after the loop,
+                    #   since we always return before exhausting val_dataloader -- moved here
+                    #   so it actually runs every val() call
+                    qual_images = self.do_qual_val(batch['sample_pixels'])
+                    return sum(losses) / len(losses), qual_images
+            qual_images = self.do_qual_val(batch['sample_pixels'])
+            return sum(losses) / len(losses), qual_images
 
 
 def get_prompt_embeds_txt_ids(pipe, prompt, device, dtype=torch.float32):
